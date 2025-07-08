@@ -1483,6 +1483,290 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         output = output.to("cpu")
         return output
 
+class GenerativeRewardModelWorker(RewardModelWorker):
+    def _build_model(self, config):
+        # the following line is necessary
+        from torch.distributed.fsdp import CPUOffload
+        from transformers import AutoConfig, AutoModelForCausalLM
+        from verl.utils.model import get_generation_config
+
+        use_shm = config.model.get("use_shm", False)
+        # download the checkpoint from hdfs
+        local_path = copy_to_local(config.model.path, use_shm=use_shm)
+
+        if self.config.model.input_tokenizer is None:
+            self._do_switch_chat_template = False
+        else:
+            self._do_switch_chat_template = True
+            input_tokenizer_local_path = copy_to_local(config.model.input_tokenizer, use_shm=use_shm)
+            self.input_tokenizer = hf_tokenizer(input_tokenizer_local_path, trust_remote_code=config.model.get("trust_remote_code", False))
+            self.tokenizer = hf_tokenizer(local_path, trust_remote_code=config.model.get("trust_remote_code", False))
+
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+
+        trust_remote_code = config.model.get("trust_remote_code", False)
+        model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
+        model_config.num_labels = 1
+        
+        self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
+        self.generation_config.max_new_tokens = self.config.rollout.response_length
+        
+        
+        meta_info = {
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "pad_token_id": self.tokenizer.pad_token_id,
+        }
+        
+        
+        self.generation_config.update(**meta_info)
+        
+        print("generation_config", self.generation_config)
+
+        # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
+        init_context = get_init_weight_context_manager(use_meta_tensor=not model_config.tie_word_embeddings, mesh=self.device_mesh)
+
+        with init_context(), warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            model_config.classifier_dropout = 0.0
+            reward_module = AutoModelForCausalLM.from_pretrained(
+                pretrained_model_name_or_path=local_path,
+                config=model_config,
+                torch_dtype=torch.bfloat16,
+                attn_implementation="flash_attention_2",
+                trust_remote_code=trust_remote_code,
+            )
+            
+
+            apply_monkey_patch(
+                model=reward_module,
+                use_remove_padding=config.model.get("use_remove_padding", False),
+                ulysses_sp_size=self.ulysses_sequence_parallel_size,
+            )
+
+            reward_module.to(torch.bfloat16)
+
+        auto_wrap_policy = get_fsdp_wrap_policy(module=reward_module, config=self.config.model.fsdp_config)
+
+        fsdp_mesh = self.device_mesh
+        sharding_strategy = get_sharding_strategy(fsdp_mesh)
+
+        if config.strategy == "fsdp":
+            reward_module = FSDP(
+                reward_module,
+                param_init_fn=init_fn,
+                use_orig_params=False,
+                auto_wrap_policy=auto_wrap_policy,
+                device_id=get_torch_device().current_device(),
+                sharding_strategy=sharding_strategy,  # zero3
+                sync_module_states=True,
+                cpu_offload=CPUOffload(offload_params=True),
+                forward_prefetch=self.config.model.fsdp_config.forward_prefetch,
+                device_mesh=self.device_mesh,
+            )
+        elif config.strategy == "fsdp2":
+            assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
+            cpu_offload = CPUOffloadPolicy(pin_memory=True)
+            fsdp_kwargs = {
+                "mesh": fsdp_mesh,
+                "offload_policy": cpu_offload,
+                "reshard_after_forward": config.model.fsdp_config.reshard_after_forward,
+            }
+            full_state = reward_module.state_dict()
+            apply_fsdp2(reward_module, fsdp_kwargs, config.model.fsdp_config)
+            fsdp2_load_full_state_dict(reward_module, full_state, fsdp_mesh, cpu_offload)
+        else:
+            raise NotImplementedError(f"Unknown strategy: {config.strategy}")
+        return reward_module
+    
+    def _switch_chat_template(self, data: DataProto):
+        src_max_length = data.batch["attention_mask"].shape[-1]
+
+        src_tokenizer = self.input_tokenizer
+        target_tokenizer = self.tokenizer
+
+        rm_input_ids = []
+        rm_attention_mask = []
+
+        for i in range(data.batch.batch_size[0]):
+            # extract raw prompt
+            if isinstance(data.non_tensor_batch["raw_prompt"][i], list):
+                chat: list = data.non_tensor_batch["raw_prompt"][i]
+            else:
+                chat: list = data.non_tensor_batch["raw_prompt"][i].tolist()
+
+            # extract response
+            response_ids = data.batch["responses"][i]
+            response_length = response_ids.shape[-1]
+            valid_response_length = data.batch["attention_mask"][i][-response_length:].sum()
+            valid_response_ids = response_ids[:valid_response_length]
+
+            # decode
+            response = src_tokenizer.decode(valid_response_ids)
+            # remove bos and eos
+            response = response.replace(src_tokenizer.eos_token, "")
+            
+            # todo
+            if '</think>' in response:
+                response = response[response.rindex('</think>') + len('</think>') :]
+                response = response.replace('<answer>', '').replace('</answer>', '').strip()
+
+            chat.append({"role": "assistant", "content": response})
+
+            prompt_with_chat_template = target_tokenizer.apply_chat_template(chat, add_generation_prompt=False, tokenize=False)
+            # if self.rank == 0 and i == 0:
+                # for debugging purpose
+                # print(f"Switch template. chat: {prompt_with_chat_template}")
+
+            # the maximum length is actually determined by the reward model itself
+            max_length = self.config.get("max_length", src_max_length)
+            if max_length is None:
+                max_length = src_max_length
+
+            model_inputs = target_tokenizer(prompt_with_chat_template, return_tensors="pt", add_special_tokens=False)
+            if self.rank == 0 and i == 0:
+                print(f"Switch template. model_inputs: {len(model_inputs)}")
+            input_ids, attention_mask = verl_F.postprocess_data(
+                input_ids=model_inputs["input_ids"],
+                attention_mask=model_inputs["attention_mask"],
+                max_length=max_length,
+                pad_token_id=target_tokenizer.pad_token_id,
+                left_pad=True,
+                truncation=self.config.get("truncation", "right"),
+            )  # truncate from the right
+            
+
+            rm_input_ids.append(input_ids)
+            rm_attention_mask.append(attention_mask)
+
+        rm_input_ids = torch.cat(rm_input_ids, dim=0)
+        rm_attention_mask = torch.cat(rm_attention_mask, dim=0)
+
+        rm_position_ids = compute_position_id_with_mask(rm_attention_mask)
+
+        rm_inputs = {"input_ids": rm_input_ids, "attention_mask": rm_attention_mask, "position_ids": rm_position_ids}
+        return DataProto.from_dict(rm_inputs)
+    
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_rm_score(self, data: DataProto):
+        raise ValueError("Not supported for generative reward model")
+    
+    def _generate_micro_batch(self, micro_batch):
+        if is_cuda_available:
+            from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+        elif is_npu_available:
+            from transformers.integrations.npu_flash_attention import index_first_axis, pad_input, rearrange, unpad_input
+
+        from verl.utils.ulysses import gather_outpus_and_unpad, ulysses_pad_and_slice_inputs
+
+        self.reward_module.eval()
+        
+        import contextlib
+        param_ctx = contextlib.nullcontext()
+        if isinstance(self.reward_module, FSDP):
+            param_ctx = FSDP.summon_full_params(self.reward_module, writeback=False, recurse=False)
+        with param_ctx, torch.no_grad(), torch.autocast(device_type=device_name, dtype=torch.bfloat16):
+            input_ids = micro_batch["input_ids"]
+            batch_size, seqlen = input_ids.shape
+            attention_mask = micro_batch["attention_mask"]
+            position_ids = micro_batch["position_ids"]
+
+            if self.use_remove_padding:
+                input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask)  # input_ids_rmpad (total_nnz, ...)
+                input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
+
+                # unpad the position_ids to align the rotary
+                position_ids_rmpad = index_first_axis(rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices).transpose(0, 1)
+
+                # pad and slice the inputs if sp > 1
+                if self.ulysses_sequence_parallel_size > 1:
+                    input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad_and_slice_inputs(input_ids_rmpad, position_ids_rmpad, sp_size=self.ulysses_sequence_parallel_size)
+
+                # only pass input_ids and position_ids to enable flash_attn_varlen
+                output = self.reward_module.generate(input_ids=input_ids_rmpad, attention_mask=None, position_ids=position_ids_rmpad, generation_config=self.generation_config)
+
+                # gather output if sp > 1
+                if self.ulysses_sequence_parallel_size > 1:
+                    output = gather_outpus_and_unpad(output, gather_dim=0, unpad_dim=0, padding_size=pad_size)
+            else:
+                output = self.reward_module.generate(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, use_cache=True, generation_config=self.generation_config)
+
+            return output
+        
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def generate_sequences(self, prompts: DataProto):
+        import itertools
+
+        from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
+        
+        rm_data = self._switch_chat_template(prompts)
+
+        meta_info = {
+            "eos_token_id": self.generation_config.eos_token_id if self.generation_config is not None else self.tokenizer.eos_token_id,
+            "pad_token_id": self.generation_config.pad_token_id if self.generation_config is not None else self.tokenizer.pad_token_id,
+        }
+        rm_data.meta_info.update(meta_info)
+        
+        rm_data = rm_data.to(get_torch_device().current_device())
+        
+        # perform forward computation
+        with self.ulysses_sharding_manager:
+            rm_data = self.ulysses_sharding_manager.preprocess_data(data=rm_data)
+
+            use_dynamic_bsz = self.config.use_dynamic_bsz
+            if use_dynamic_bsz:
+                max_token_len = self.config.forward_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                micro_batches, indices = rearrange_micro_batches(batch=rm_data.batch, max_token_len=max_token_len)
+            else:
+                micro_batches = rm_data.batch.split(self.config.micro_batch_size_per_gpu)
+            generations = []
+            for micro_batch in micro_batches:
+                batch_generation = self._generate_micro_batch(micro_batch)
+                generations += batch_generation
+            from torch.nn.utils.rnn import pad_sequence
+            generations = pad_sequence(generations, batch_first=True, padding_value=self.generation_config.pad_token_id)
+            
+            max_length = self.config.rollout.response_length + self.config.rollout.prompt_length
+            if generations.shape[1] < max_length:
+            # 计算缺少的长度
+                pad_width = max_length - generations.shape[1]
+                # 补 padding
+                pad_tensor = torch.full((generations.shape[0], pad_width), self.generation_config.pad_token_id, dtype=generations.dtype)
+                generations = torch.cat([generations, pad_tensor], dim=1)
+            else:
+                generations = generations[:, :max_length]
+
+            if use_dynamic_bsz:
+                indices = list(itertools.chain.from_iterable(indices))
+                assert len(indices) == len(generations), f"{len(indices)} vs. {len(generations)}"
+                revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
+                generations = generations[revert_indices]
+                
+            # Note that this is only the scores, may not be the final rewards used to train RL
+            output = DataProto.from_dict(tensors={"grm_responses": generations})
+            output = self.ulysses_sharding_manager.postprocess_data(data=output)
+
+        # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
+        # unshard the root FSDP module
+        if self.world_size > 1 and fsdp_version(self.reward_module) == 1:
+            self.reward_module._handle.reshard(True)
+        
+        grm_responses_str = []
+        for i in range(len(output)): 
+            response_ids = output.batch["grm_responses"][i]
+            # print("grm response_ids", response_ids)
+            response_ids = response_ids[len(rm_data.batch["input_ids"][i]):]
+            response_length = response_ids.shape[-1]
+            valid_response_length = rm_data.batch["attention_mask"][i][-response_length:].sum()
+            valid_response_ids = response_ids[:valid_response_length]
+
+            grm_responses_str.append(self.tokenizer.decode(valid_response_ids))
+        output.non_tensor_batch['grm_responses_str'] = grm_responses_str
+
+        # clear kv cache
+        get_torch_device().empty_cache()
+        return output
+        
 
 # ================================= Async related workers =================================
 class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):

@@ -19,6 +19,10 @@ from verl import DataProto
 
 
 class BaseShardingManager:
+    
+    def __init__(self) -> None:
+        self.timing = {}
+    
     def __enter__(self):
         pass
 
