@@ -33,17 +33,18 @@ def extract_solution(solution_str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--local_dir", default="~/data/safe_rlhf")
+    parser.add_argument("--local_dir", default="data/safe_rlhf")
     parser.add_argument("--max_examples", type=int, default=None)
     parser.add_argument("--hdfs_dir", default=None)
     parser.add_argument("--seed", default=42, type=int)
+    parser.add_argument("--wo_safety", action="store_true")
 
     args = parser.parse_args()
 
-    safe_data_source = "/home/mouyutao/lyx/Safety/data/PKU-SafeRLHF-prompt"
+    safe_data_source = "PKU-Alignment/PKU-SafeRLHF-prompt"
 
-    math_data_source = "/home/mouyutao/lyx/Safety/data/gsm8k"
-    code_data_source = "/home/mouyutao/lyx/Safety/data/code-r1-12k"
+    math_data_source = "openai/gsm8k"
+    code_data_source = "ganler/code-r1-12k"
 
     columes_to_keep = ["data_source", "prompt", "ability", "reward_model", "extra_info"]
     safe_dataset = datasets.load_dataset(safe_data_source)["train"]
@@ -123,6 +124,10 @@ if __name__ == "__main__":
         print("Not supported for now")
         exit(1)
 
+    # 把安全去掉
+    if args.wo_safety:
+        dataset = dataset.filter(lambda x: x['ability'] != 'safety')
+
     dataset_dict = dataset.train_test_split(test_size=0.1)
     train_dataset, test_dataset = dataset_dict["train"], dataset_dict["test"]
 
@@ -144,7 +149,7 @@ if __name__ == "__main__":
                 return item['jailbreak_prompt'].format(query=item['query'])
         return item['query']
     for dataset in SAFE_TEST_DATASETS:
-        with open(f'/home/mouyutao/lyx/SaRO_eval/data/safety/{dataset}.json') as f:
+        with open(f'data/safety/{dataset}.json') as f:
             safe_test_dataset = json.load(f)
         safe_test_dataset = [
             {
@@ -171,7 +176,7 @@ if __name__ == "__main__":
         ])
 
     # 过度拒绝测试
-    with open(f'/home/mouyutao/lyx/SaRO_eval/data/safety/XSTest.json') as f:
+    with open(f'data/safety/XSTest.json') as f:
         xstest_dataset = json.load(f)
     xstest_dataset = [
         {
@@ -202,12 +207,17 @@ if __name__ == "__main__":
     local_dir = args.local_dir
     hdfs_dir = args.hdfs_dir
 
-    if args.max_examples:
-        train_dataset.to_parquet(os.path.join(local_dir, f"train_{args.max_examples}.parquet"))
-        test_dataset.to_parquet(os.path.join(local_dir, f"test_{args.max_examples}.parquet"))
+    if args.wo_safety:
+        suffix = '_wo_safety'
     else:
-        train_dataset.to_parquet(os.path.join(local_dir, "train.parquet"))
-        test_dataset.to_parquet(os.path.join(local_dir, "test.parquet"))
+        suffix = ''
+
+    if args.max_examples:
+        train_dataset.to_parquet(os.path.join(local_dir, f"train_{args.max_examples}{suffix}.parquet"))
+        test_dataset.to_parquet(os.path.join(local_dir, f"test_{args.max_examples}{suffix}.parquet"))
+    else:
+        train_dataset.to_parquet(os.path.join(local_dir, f"train{suffix}.parquet"))
+        test_dataset.to_parquet(os.path.join(local_dir, f"test{suffix}.parquet"))
 
     if hdfs_dir is not None:
         makedirs(hdfs_dir)
