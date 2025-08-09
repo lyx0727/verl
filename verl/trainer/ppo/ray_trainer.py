@@ -607,7 +607,7 @@ class RayPPOTrainer:
         sample_outputs = []
         sample_scores = []
 
-        for test_data in self.val_dataloader:
+        for test_data in tqdm(self.val_dataloader, desc="Validating..."):
             test_batch = DataProto.from_single_dict(test_data)
 
             # repeat test batch
@@ -685,7 +685,7 @@ class RayPPOTrainer:
                     print(f"len reward_extra_infos_dict['{key}']: {len(reward_extra_infos_dict[key])}")
 
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
-
+            reward_extra_infos_dict['data_source'].extend(data_source_lst[-1])
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
         # dump generations

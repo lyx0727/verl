@@ -20,7 +20,7 @@ import json, os
 import time
 import subprocess
 from tempfile import NamedTemporaryFile, TemporaryDirectory
-from concurrent import futures
+from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 
 from verl import DataProto
 from verl.utils.reward_score import default_compute_score
@@ -275,6 +275,7 @@ def compute_overrefusal_score(output: str, prompt: str, ground_truth: str):
                     ],
                     temperature=0,
                     max_tokens=100,
+                    timeout=60,
                 )
                 output = response.choices[0].message.content
                 break
@@ -313,20 +314,22 @@ def compute_overrefusal_score(output: str, prompt: str, ground_truth: str):
 class MultiThreadingHandler:
     def __init__(self, num_threads: int = 8):
         self.num_threads = num_threads
-        self.executor = futures.ThreadPoolExecutor(max_workers=num_threads)
-        self.futures: list[futures.Future] = []
+        self.executor = ThreadPoolExecutor(max_workers=num_threads)
+        self.futures: list[Future] = []
+        self.func2index = {}
 
     def add_request(self, fn, *args):
         future = self.executor.submit(fn, *args)
+        self.func2index[future] = len(self.futures)
         self.futures.append(future)
     def wait(self):
-        results = []
-        for future in futures.as_completed(self.futures):
+        results = [None for _ in range(len(self.futures))]
+        for future in as_completed(self.futures):
+            i = self.func2index.pop(future)
             try:
-                results.append(future.result())
+                results[i] = future.result()
             except Exception as e:
-                # print(f"Exception occurred: {str(e)}")
-                results.append((0.0, str(e)))  # 也可以自定义错误处理逻辑
+                results[i] = (0.0, str(e))
         return results
 
 @register("safety")
@@ -359,6 +362,7 @@ class SafetyRewardManager:
 
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
         reward_extra_info = defaultdict(list)
+        reward_extra_info["score_response"] = [None for _ in range(len(data))]
 
         already_print_data_sources = {}
 
@@ -418,6 +422,7 @@ class SafetyRewardManager:
 
             reward = score
             reward_tensor[i, valid_response_length - 1] = reward
+            reward_extra_info["score_response"][i] = score_response
 
             data_source = data.non_tensor_batch[self.reward_fn_key][i]
 
