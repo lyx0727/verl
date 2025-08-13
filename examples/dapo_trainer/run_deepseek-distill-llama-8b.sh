@@ -1,0 +1,64 @@
+export CUDA_VISIBLE_DEVICES=4,5,6,7
+export RAY_TMPDIR=$HOME/lyx/.tmp
+export WANDB_API_KEY=09f50e022adfb719d63d3e9df0fb0644c2ba3670
+
+N_GPUS=4
+MODEL=$HOME/Models/DeepSeek-R1-Distill-Llama-8B
+PROJECT_NAME=rl_dapo_deepseek-r1-distill-llama-8b
+EXP_NAME=gsm8k
+
+
+micro_batch_size=8
+mini_batch_size=$((16 * $N_GPUS * $micro_batch_size))
+train_batch_size=$mini_batch_size
+
+python3 -m recipe.dapo.src.main_dapo \
+    algorithm.adv_estimator=grpo \
+    data.train_files=data/gsm8k/train.parquet \
+    data.val_files=data/gsm8k/test.parquet \
+    data.train_batch_size=$train_batch_size \
+    data.max_prompt_length=512 \
+    data.max_response_length=4096 \
+    data.filter_overlong_prompts=True \
+    actor_rollout_ref.model.path=$MODEL \
+    actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    actor_rollout_ref.model.use_remove_padding=True \
+    actor_rollout_ref.actor.loss_agg_mode='token-mean' \
+    actor_rollout_ref.actor.ppo_mini_batch_size=$mini_batch_size \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$micro_batch_size \
+    actor_rollout_ref.actor.clip_ratio_low=0.2 \
+    actor_rollout_ref.actor.clip_ratio_high=0.28 \
+    actor_rollout_ref.actor.clip_ratio_c=10.0 \
+    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
+    actor_rollout_ref.actor.kl_loss_coef=0.001 \
+    actor_rollout_ref.actor.kl_loss_type='low_var_kl' \
+    actor_rollout_ref.actor.entropy_coeff=0 \
+    actor_rollout_ref.actor.fsdp_config.param_offload=True \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$micro_batch_size \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=$N_GPUS \
+    actor_rollout_ref.rollout.name='vllm' \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
+    actor_rollout_ref.rollout.n=4 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$micro_batch_size \
+    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    algorithm.use_kl_in_reward=False \
+    algorithm.filter_groups.enable=False \
+    algorithm.filter_groups.max_num_gen_batches=10 \
+    algorithm.filter_groups.metric=acc \
+    reward_model.reward_manager=dapo \
+    reward_model.overlong_buffer.enable=True \
+    reward_model.overlong_buffer.len=1024 \
+    reward_model.overlong_buffer.penalty_factor=1.0 \
+    trainer.critic_warmup=0 \
+    trainer.logger=['console','wandb'] \
+    trainer.log_val_generations=-1 \
+    trainer.project_name=$PROJECT_NAME \
+    trainer.experiment_name=$EXP_NAME \
+    trainer.n_gpus_per_node=$N_GPUS \
+    trainer.nnodes=1 \
+    trainer.val_before_train=True \
+    trainer.save_freq=10 \
+    trainer.test_freq=10 \
+    trainer.total_epochs=15;

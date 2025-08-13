@@ -124,3 +124,7 @@ logs
 log
 outputs
 .history
+models
+*log
+checkpoints
+validation
