@@ -128,3 +128,5 @@ models
 *log
 checkpoints
 validation
+tensorboard_log
+tmp*

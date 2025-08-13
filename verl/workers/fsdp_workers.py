@@ -1230,15 +1230,22 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
         trust_remote_code = config.model.get("trust_remote_code", False)
         model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
-        model_config.num_labels = 1
+        
+        # TODO: hack score model
+        if model_config.architectures[0] == "LlamaForScore":
+            from safe_rlhf.models import AutoModelForScore
+            reward_module_class = AutoModelForScore
+        else:
+            reward_module_class = AutoModelForTokenClassification
+            model_config.num_labels = 1
+            model_config.classifier_dropout = 0.0
 
         # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
         init_context = get_init_weight_context_manager(use_meta_tensor=not model_config.tie_word_embeddings, mesh=self.device_mesh)
 
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            model_config.classifier_dropout = 0.0
-            reward_module = AutoModelForTokenClassification.from_pretrained(
+            reward_module = reward_module_class.from_pretrained(
                 pretrained_model_name_or_path=local_path,
                 config=model_config,
                 torch_dtype=torch.bfloat16,
@@ -1325,6 +1332,8 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
                 # only pass input_ids and position_ids to enable flash_attn_varlen
                 output = self.reward_module(input_ids=input_ids_rmpad, attention_mask=None, position_ids=position_ids_rmpad, use_cache=False)
+                if hasattr(output, 'scores'):
+                    raise NotImplementedError("Reward module should return logits")
                 reward_rmpad = output.logits
                 reward_rmpad = reward_rmpad.squeeze(0)  # (total_nnz)
 
@@ -1336,7 +1345,10 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 rm_score = pad_input(reward_rmpad, indices=indices, batch=batch_size, seqlen=seqlen).squeeze(-1)
             else:
                 output = self.reward_module(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, use_cache=False)
-                rm_score = output.logits  # (batch_size, seq_len, 1)
+                if hasattr(output, 'scores'):
+                    rm_score = output.scores
+                else:
+                    rm_score = output.logits    # (batch_size, seq_len, 1)
                 rm_score = rm_score.squeeze(-1)
 
             # extract the result of the last valid token
@@ -1367,6 +1379,10 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         src_tokenizer = self.input_tokenizer
         target_tokenizer = self.tokenizer
 
+        # TODO: hack score model
+        if self.reward_module.config.architectures[0] == "LlamaForScore":
+            target_tokenizer.chat_template = """BEGINNING OF CONVERSATION: {%- for message in messages %}{%- if message['role'] == 'user' %}User: {{ message['content'] }}{%- elif message['role'] == 'assistant' %}ASSISTANT: {{ message['content'] }}{%- endif %}{%- endfor%}"""
+
         rm_input_ids = []
         rm_attention_mask = []
 
@@ -1387,6 +1403,11 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             response = src_tokenizer.decode(valid_response_ids)
             # remove bos and eos
             response = response.replace(src_tokenizer.eos_token, "")
+
+            # TODO: extract final answer
+            if '</think>' in response:
+                response = response[response.rindex('</think>') + len('</think>') :]
+                response = response.replace('<answer>', '').replace('</answer>', '').strip()
 
             chat.append({"role": "assistant", "content": response})
 

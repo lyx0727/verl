@@ -332,6 +332,9 @@ class MultiThreadingHandler:
                 results[i] = (0.0, str(e))
         return results
 
+def RED(x): return f"\033[1;31m{x}\033[0m"
+def GREEN(x): return f"\033[1;32m{x}\033[0m"
+
 @register("safety")
 class SafetyRewardManager:
     """The reward manager."""
@@ -354,11 +357,13 @@ class SafetyRewardManager:
         """We will expand this function gradually based on the available datasets"""
 
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
-        if "rm_scores" in data.batch.keys():
-            if return_dict:
-                return {"reward_tensor": data.batch["rm_scores"]}
-            else:
-                return data.batch["rm_scores"]
+        # # TODO: hack 如果是训练时，则直接计算分数
+        # if "rm_scores" in data.batch.keys() and num_examine == 0:
+        #     breakpoint()
+        #     if return_dict:
+        #         return {"reward_tensor": data.batch["rm_scores"]}
+        #     else:
+        #         return data.batch["rm_scores"]
 
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
         reward_extra_info = defaultdict(list)
@@ -366,7 +371,7 @@ class SafetyRewardManager:
 
         already_print_data_sources = {}
 
-        num_threads = min(8, len(data))
+        num_threads = min(16, len(data))
         handler = MultiThreadingHandler(num_threads)
 
         prompt_strs, response_strs, valid_response_lengths = [], [], []
@@ -405,7 +410,14 @@ class SafetyRewardManager:
                 ground_truth = data.non_tensor_batch['reward_model'][i]['ground_truth']
 
                 if ability == 'safety':
-                    handler.add_request(compute_safety_score, response_str, prompt_str, ground_truth)
+                    # TODO: hack 如果是训练时，则直接计算分数
+                    if "rm_scores" in data.batch.keys() and self.num_examine == 0:
+                        score = data.batch["rm_scores"][i][valid_response_length - 1].item()
+                        # beaver cost model 是 harmful 的分数，取反
+                        score = -score
+                        handler.add_request(lambda: (score, None))
+                    else:
+                        handler.add_request(compute_safety_score, response_str, prompt_str, ground_truth)
                 elif ability == 'coding':
                     handler.add_request(compute_code_score, response_str, prompt_str, ground_truth)
                 elif ability == 'math':
@@ -431,11 +443,15 @@ class SafetyRewardManager:
 
             if already_print_data_sources[data_source] < self.num_examine:
                 already_print_data_sources[data_source] += 1
+                COLOR = GREEN if reward > 0 else RED
                 print("[data_source]", data_source)
                 print("[prompt]", prompt_str)
-                print("[response]", extract_answer(response_str))
-                print("[score_response]", score_response)
-                print("[score]", score)
+                print("[response]", COLOR(extract_answer(response_str)))
+                print("[score_response]", COLOR(score_response))
+
+        if "rm_scores" in data.batch.keys():
+            reward_scores = data.batch["rm_scores"]
+            reward_extra_info["reward_scores"] = reward_scores.tolist()
 
         if return_dict:
             return {

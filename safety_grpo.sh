@@ -3,9 +3,6 @@ export OPENAI_SAFEGUARD_BASE_URL=http://localhost:8848/v1
 export OPENAI_API_KEY=sk-lyUkMdrohSuN3zFWjbUnJpeIowI17fRe9XqpazIBJ8HkFsxd
 export WANDB_API_KEY=09f50e022adfb719d63d3e9df0fb0644c2ba3670
 
-export RAY_TMPDIR=/home/mouyutao/lyx/verl/tmp
-export RAY_spill_disk_threshold=0.99
-
 export SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK=True
 
 # export NCCL_P2P_DISABLE=1
@@ -28,22 +25,27 @@ echo "GPUS_PER_NODE" $GPUS_PER_NODE;
 #    main_ppo.py:main_task - and comment "Role.RefPolicy..." in "role_worker_mapping = ".
 
 # MAIN CONFIG
-MAX_EPOCHS=3
-DATASET=safe_rlhf_v2
-MODEL_PATH=/home/mouyutao/Models/DeepSeek-R1-Distill-Llama-8B
+PROJECT_NAME=safety-r1
+EXP_NAME=DeepSeek-R1-Distill-Llama-8B
+USE_SCORE=false
+VAL_BEFORE_TRAIN=false
+
+MAX_EPOCHS=1
+DATASET=safe_rlhf
+MODEL_PATH=deepseek-ai/DeepSeek-R1-Distill-Llama-8B
 ROLLOUT_N_SAMPLE=16
 MICRO_BATCH_PER_GPU=16 # * GPUS_PER_NODE -> GLOBAL_BATCH_SIZE
-GRAD_ACC_STEPS=2
-GLOBAL_BATCH_SIZE=$(($(($GPUS_PER_NODE * $MICRO_BATCH_PER_GPU)) * $GRAD_ACC_STEPS))
+GLOBAL_BATCH_SIZE=128
+GRAD_ACC_STEPS=$(( $GLOBAL_BATCH_SIZE / $MICRO_BATCH_PER_GPU / $GPUS_PER_NODE ))
 ROLLOUT_N_QUERY=$(( $GLOBAL_BATCH_SIZE /  $ROLLOUT_N_SAMPLE ))
 
-PROJECT_NAME=safety-r1
-EXP_NAME=DeepSeek-R1-Distill-Llama-8B_v2_0728_test
-
 echo "GLOBAL_BATCH_SIZE: $GLOBAL_BATCH_SIZE"
+echo "GRAD_ACC_STEPS: $GRAD_ACC_STEPS"
 echo "ROLLOUT_N_QUERY: $ROLLOUT_N_QUERY"
+echo "EXP_NAME: $EXP_NAME"
 
-JUDGE_MODEL=/home/mouyutao/Models/Llama-Guard-3-8B
+JUDGE_MODEL=meta-llama/Llama-Guard-3-8B
+SCORE_MODEL=PKU-Alignment/beaver-7b-v3.0-cost
 
 # assert ROLLOUT_N_QUERY * ROLLOUT_N_SAMPLE % GLOBAL_BATCH_SIZE == 0
 TOTAL_SAMPLES=$(( $ROLLOUT_N_QUERY * $ROLLOUT_N_SAMPLE ))
@@ -108,12 +110,15 @@ HYDRA_FULL_ERROR=1 python3 -m verl.trainer.main_ppo \
     trainer.total_epochs=$MAX_EPOCHS \
     trainer.log_val_generations=-1 \
     trainer.validation_data_dir=$VAL_DATA_DIR \
-    trainer.val_before_train=true \
+    trainer.val_before_train=$VAL_BEFORE_TRAIN \
     reward_model.reward_manager=safety \
+    reward_model.enable=$USE_SCORE \
+    reward_model.micro_batch_size_per_gpu=$MICRO_BATCH_PER_GPU \
+    reward_model.model.path=$SCORE_MODEL \
+    reward_model.model.use_remove_padding=false \
     grm.enable=false \
     grm.model.path=$JUDGE_MODEL \
     grm.rollout.name=hf \
     grm.micro_batch_size_per_gpu=$MICRO_BATCH_PER_GPU \
     grm.rollout.prompt_length=32768 \
-    grm.rollout.response_length=128 \
-    $@ 2>&1 | tee grpo_0728.log
+    grm.rollout.response_length=128 2>&1 | tee logs/${PROJECT_NAME}-${EXP_NAME}.log

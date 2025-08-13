@@ -38,6 +38,10 @@ if __name__ == "__main__":
     parser.add_argument("--hdfs_dir", default=None)
     parser.add_argument("--seed", default=42, type=int)
     parser.add_argument("--wo_safety", action="store_true")
+    parser.add_argument("--wo_test_jailbreak", action="store_true")
+    parser.add_argument("--wo_test_xstest", action="store_true")
+    parser.add_argument("--w_jailbreak", action="store_true")
+    parser.add_argument("--w_math_jailbreak", action="store_true")
 
     args = parser.parse_args()
 
@@ -108,21 +112,61 @@ if __name__ == "__main__":
     math_dataset = math_dataset.map(math_dataset_mapper, with_indices=True).select_columns(columes_to_keep)
     code_dataset = code_dataset.map(code_dataset_mapper, with_indices=True).select_columns(columes_to_keep)
 
-    print("safe", safe_dataset)
-    print("math", math_dataset)
-    print("code", code_dataset)
-
-    
     if args.max_examples:
         safe_dataset = safe_dataset.shuffle(seed=args.seed).select(range(args.max_examples))
         # 安全数学代码取 2:1:1 暂时
         math_dataset = math_dataset.shuffle(seed=args.seed).select(range(args.max_examples // 2))
         code_dataset = code_dataset.shuffle(seed=args.seed).select(range(args.max_examples // 2))
-        dataset = datasets.concatenate_datasets([safe_dataset, math_dataset, code_dataset])
-        dataset = dataset.shuffle(seed=args.seed)
     else:
         print("Not supported for now")
         exit(1)
+
+    print("safe", safe_dataset)
+    print("math", math_dataset)
+    print("code", code_dataset)
+
+    if args.w_jailbreak or args.w_math_jailbreak:
+        import pandas as pd
+        jailbreak_templates = []
+        for dataset in ['SGB_art', 'SGB_autodan']:
+            data = pd.read_json(f'data/safety/{dataset}.json')
+            templates = data['jailbreak_prompt'].unique().tolist()
+            jailbreak_templates += [
+                {
+                    'template': template,
+                    'source': f'{dataset}_{index}',
+                }
+                for index, template in enumerate(templates)
+            ]
+        print("use jailbreak_templates", len(jailbreak_templates))
+
+        def jailbreak(dataset, jailbreak_templates):
+            jailbroken_dataset = []
+            for example in dataset:
+                prompt = example.pop('prompt')
+                data_source = example.pop('data_source')
+                for template in jailbreak_templates:
+                    jailbroken_dataset.append(example | {
+                        'prompt': [{ 'role': 'user', 'content': template['template'].format(query=prompt[0]['content']) }],
+                        'data_source': data_source + '_jailbroken_' + template['source']
+                    })
+            jailbroken_dataset = datasets.Dataset.from_list(jailbroken_dataset)
+            return jailbroken_dataset
+
+        if args.w_jailbreak:
+            jailbroken_safe_dataset = jailbreak(safe_dataset, jailbreak_templates)
+            # TODO: 2:1 混合
+            jailbroken_safe_dataset = jailbroken_safe_dataset.shuffle(seed=args.seed).select(range(len(safe_dataset) // 2))
+            safe_dataset = datasets.concatenate_datasets([safe_dataset, jailbroken_safe_dataset])
+
+        if args.w_math_jailbreak:
+            jailbroken_math_dataset = jailbreak(math_dataset, jailbreak_templates)
+            # TODO: 2:1 混合
+            jailbroken_math_dataset = jailbroken_math_dataset.shuffle(seed=args.seed).select(range(len(math_dataset)))
+            math_dataset = datasets.concatenate_datasets([math_dataset, jailbroken_math_dataset])
+
+    dataset = datasets.concatenate_datasets([safe_dataset, math_dataset, code_dataset])
+    dataset = dataset.shuffle(seed=args.seed)
 
     # 把安全去掉
     if args.wo_safety:
@@ -131,36 +175,65 @@ if __name__ == "__main__":
     dataset_dict = dataset.train_test_split(test_size=0.1)
     train_dataset, test_dataset = dataset_dict["train"], dataset_dict["test"]
 
+    # TEST
     # todo: 在 test_dataset 加入越狱攻击的数据
+    if not args.wo_test_jailbreak:
+        SAFE_TEST_DATASETS = [
+            # 'SGB_art',
+            # 'SGB_autodan',
+            'SGB_pair',
+            'WildJailbreak',
+            # 'ALERT',
+            # 'SaladBench',
+        ]
+        def get_jailbreak_query(item):
+            if item.get('jailbreak_prompt'):
+                if item.get('reference_responses'):
+                    return item['jailbreak_prompt'].format(query=item['query'], reference_responses=item['reference_responses'][0])
+                else:
+                    return item['jailbreak_prompt'].format(query=item['query'])
+            return item['query']
+        for dataset in SAFE_TEST_DATASETS:
+            with open(f'data/safety/{dataset}.json') as f:
+                safe_test_dataset = json.load(f)
+            safe_test_dataset = [
+                {
+                    "data_source": dataset.upper() if dataset == 'SGB_pair' else dataset,
+                    "prompt": [
+                        {
+                            "role": "user",
+                            "content": get_jailbreak_query(item),
+                        }
+                    ],
+                    "ability": "safety",
+                    "reward_model": {"style": "model", "ground_truth": ""},
+                    "extra_info": {
+                        "split": "test",
+                        "index": idx,
+                        "query": item['query'],
+                    }
+                }
+                for idx, item in enumerate(safe_test_dataset)
+            ]
+            test_dataset = datasets.concatenate_datasets([
+                test_dataset, 
+                datasets.Dataset.from_list(safe_test_dataset).select_columns(columes_to_keep).shuffle(seed=args.seed).select(range(len(safe_test_dataset) // 10))
+            ])
 
-    SAFE_TEST_DATASETS = [
-        # 'SGB_art',
-        # 'SGB_autodan',
-        'SGB_pair',
-        'WildJailbreak',
-        # 'ALERT',
-        # 'SaladBench',
-    ]
-    def get_jailbreak_query(item):
-        if item.get('jailbreak_prompt'):
-            if item.get('reference_responses'):
-                return item['jailbreak_prompt'].format(query=item['query'], reference_responses=item['reference_responses'][0])
-            else:
-                return item['jailbreak_prompt'].format(query=item['query'])
-        return item['query']
-    for dataset in SAFE_TEST_DATASETS:
-        with open(f'data/safety/{dataset}.json') as f:
-            safe_test_dataset = json.load(f)
-        safe_test_dataset = [
+    if not args.wo_test_xstest:
+        # 过度拒绝测试
+        with open(f'data/safety/XSTest.json') as f:
+            xstest_dataset = json.load(f)
+        xstest_dataset = [
             {
-                "data_source": dataset.upper() if dataset == 'SGB_pair' else dataset,
+                "data_source": 'XSTest',
                 "prompt": [
                     {
                         "role": "user",
-                        "content": get_jailbreak_query(item),
+                        "content": item['query'],
                     }
                 ],
-                "ability": "safety",
+                "ability": "overrefusal",
                 "reward_model": {"style": "model", "ground_truth": ""},
                 "extra_info": {
                     "split": "test",
@@ -168,39 +241,12 @@ if __name__ == "__main__":
                     "query": item['query'],
                 }
             }
-            for idx, item in enumerate(safe_test_dataset)
+            for idx, item in enumerate(xstest_dataset)
         ]
         test_dataset = datasets.concatenate_datasets([
             test_dataset, 
-            datasets.Dataset.from_list(safe_test_dataset).select_columns(columes_to_keep).shuffle(seed=args.seed).select(range(len(safe_test_dataset) // 10))
+            datasets.Dataset.from_list(xstest_dataset).select_columns(columes_to_keep).shuffle(seed=args.seed).select(range(len(xstest_dataset) // 10))
         ])
-
-    # 过度拒绝测试
-    with open(f'data/safety/XSTest.json') as f:
-        xstest_dataset = json.load(f)
-    xstest_dataset = [
-        {
-            "data_source": 'XSTest',
-            "prompt": [
-                {
-                    "role": "user",
-                    "content": item['query'],
-                }
-            ],
-            "ability": "overrefusal",
-            "reward_model": {"style": "model", "ground_truth": ""},
-            "extra_info": {
-                "split": "test",
-                "index": idx,
-                "query": item['query'],
-            }
-        }
-        for idx, item in enumerate(xstest_dataset)
-    ]
-    test_dataset = datasets.concatenate_datasets([
-        test_dataset, 
-        datasets.Dataset.from_list(xstest_dataset).select_columns(columes_to_keep).shuffle(seed=args.seed).select(range(len(xstest_dataset) // 10))
-    ])
 
     print("test_dataset", len(test_dataset))
 
@@ -211,6 +257,15 @@ if __name__ == "__main__":
         suffix = '_wo_safety'
     else:
         suffix = ''
+        if args.w_jailbreak:
+            suffix += '_w_jailbreak'
+        if args.w_math_jailbreak:
+            suffix += '_w_math_jailbreak'
+
+    if args.wo_test_jailbreak:
+        suffix += '_wo_test_jailbreak'
+    if args.wo_test_xstest:
+        suffix += '_wo_test_xstest'
 
     if args.max_examples:
         train_dataset.to_parquet(os.path.join(local_dir, f"train_{args.max_examples}{suffix}.parquet"))
